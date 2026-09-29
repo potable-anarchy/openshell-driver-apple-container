@@ -540,7 +540,12 @@ impl AppleContainerComputeDriver {
             args.push(cpus);
         }
 
-        for cap in ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"] {
+        // Capability set matches upstream `launch-capability-free` (podman container.rs:1526): the
+        // boundary starts as root with the minimal caps it needs to chown workspace + drop to
+        // the workload identity. No broader admin caps (SYS_ADMIN / NET_ADMIN / SYS_PTRACE / SYSLOG
+        // were removed; the workload does not own container networking — supervisor handles egress
+        // over the boundary's UDS channel).
+        for cap in ["CHOWN", "SETGID", "SETUID", "SETPCAP"] {
             args.push("--cap-add".to_string());
             args.push(cap.to_string());
         }
