@@ -64,6 +64,14 @@ const DEFAULT_WORKLOAD_GID: u32 = 1000;
 #[cfg(test)]
 const DRIVER_ADMITTED_BACKEND: &str = openshell_sandbox_backend::BACKEND_NAME;
 
+/// Environment variable override for the macOS host-built supervisor binary
+/// location. Used by trybox install so operators can swap binaries without
+/// touching the driver's guest-bin tree.
+pub const HOST_SUPERVISOR_BIN_ENV: &str = "OPENSHELL_APPLE_CONTAINER_HOST_SUPERVISOR_BIN";
+/// Default host supervisor path when the env override is unset. Expected layout:
+/// `~/.local/share/trybox/host-bin/openshell-supervisor` (aarch64-apple-darwin).
+pub const HOST_SUPERVISOR_BIN_DEFAULT: &str = "host-bin/openshell-supervisor";
+
 #[derive(Debug)]
 struct AppleSecretStagingDirs {
     supervisor_mount_dir: PathBuf,
@@ -106,6 +114,10 @@ pub struct AppleContainerComputeDriver {
     gateway_bind_addresses: Vec<SocketAddr>,
     supervisor_readiness: Arc<dyn SupervisorReadiness>,
     events: broadcast::Sender<WatchSandboxesEvent>,
+    /// Per-sandbox supervisor child processes the driver owns on the host.
+    /// Inserted at `create_sandbox`; removed when the child exits normally; killed
+    /// on `delete_sandbox`. Keyed by sandbox id.
+    supervisor_children: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::process::Child>>>,
 }
 
 impl std::fmt::Debug for AppleContainerComputeDriver {
@@ -136,6 +148,7 @@ impl AppleContainerComputeDriver {
             gateway_bind_addresses,
             supervisor_readiness,
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_children: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -245,6 +258,34 @@ impl AppleContainerComputeDriver {
             cleanup_secret_staging_dir(&sandbox.id, &self.config);
             return Err(status_from_cli(err));
         }
+
+        // Spawn the macOS host-side supervisor AFTER the boundary container is up.
+        // The supervisor dials the boundary over the virtiofs-bridged UDS channel.
+        // If the supervisor fails to spawn, clean up the partial sandbox state.
+        let launch_authentication = decode_launch_authentication(sandbox)?;
+        if let Err(spawn_err) = self.spawn_host_supervisor(sandbox, &launch_authentication).await {
+            warn!(
+                sandbox_id = %sandbox.id,
+                error = %spawn_err,
+                "host supervisor spawn failed; cleaning up partially-created sandbox"
+            );
+            let container_name = container_name_for_sandbox(sandbox);
+            if let Err(delete_err) = self.cli.delete(&container_name).await {
+                let status = status_from_cli(delete_err);
+                if status.code() != tonic::Code::NotFound {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        container = %container_name,
+                        error = %status,
+                        "Failed to delete Apple container after supervisor spawn failure"
+                    );
+                }
+            }
+            self.cleanup_volume_with_warning(&volume, &sandbox.id, "supervisor-spawn-failed")
+                .await;
+            cleanup_secret_staging_dir(&sandbox.id, &self.config);
+            return Err(spawn_err);
+        }
         Ok(())
     }
 
@@ -303,6 +344,9 @@ impl AppleContainerComputeDriver {
         sandbox_name: &str,
     ) -> Result<bool, Status> {
         require_sandbox_identifier(sandbox_id, sandbox_name)?;
+        // Kill the host-side supervisor first so its kill-on-drop propagation has
+        // time to exit the boundary cleanly before we destroy the container.
+        self.terminate_host_supervisor(sandbox_id).await;
         let Some(entry) = self.find_managed_entry(sandbox_id, sandbox_name).await? else {
             if !sandbox_id.is_empty() {
                 self.cleanup_volume_with_warning(
@@ -322,6 +366,11 @@ impl AppleContainerComputeDriver {
             .cloned()
             .unwrap_or_else(|| sandbox_id.to_string());
         let deleted = self.cli.delete(&entry.id).await.map_err(status_from_cli)?;
+        // Host supervisor may have respawned or belong to the resolved id variant —
+        // terminate that as well.
+        if resolved_id != sandbox_id {
+            self.terminate_host_supervisor(&resolved_id).await;
+        }
         if !resolved_id.is_empty() {
             self.cleanup_volume_with_warning(
                 &volume_name(&resolved_id),
@@ -458,6 +507,153 @@ impl AppleContainerComputeDriver {
         }
     }
 
+    /// Resolve the absolute path to the host-side openshell-supervisor binary.
+    ///
+    /// Honors `OPENSHELL_APPLE_CONTAINER_HOST_SUPERVISOR_BIN`; otherwise
+    /// returns `~/.local/share/trybox/host-bin/openshell-supervisor` when the
+    /// `host_supervisor_bin` config field is unset.
+    pub fn host_supervisor_bin(&self) -> PathBuf {
+        if let Ok(override_path) = std::env::var(crate::driver::HOST_SUPERVISOR_BIN_ENV)
+            && !override_path.trim().is_empty()
+        {
+            return PathBuf::from(override_path);
+        }
+        if let Some(cfg_path) = self.config.host_supervisor_bin.as_ref()
+            && !cfg_path.as_os_str().is_empty()
+        {
+            return cfg_path.clone();
+        }
+        // default: $HOME/.local/share/trybox/host-bin/openshell-supervisor
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        PathBuf::from(home)
+            .join(".local/share/trybox")
+            .join(HOST_SUPERVISOR_BIN_DEFAULT)
+    }
+
+    /// Kill the host-side openshell-supervisor process for `sandbox_id` if one is
+    /// running, and remove it from the tracked map. Safe to call when nothing is
+    /// present; errors are swallowed to keep delete paths idempotent.
+    async fn terminate_host_supervisor(&self, sandbox_id: &str) {
+        let mut guard = self.supervisor_children.lock().await;
+        if let Some(mut child) = guard.remove(sandbox_id) {
+            if let Err(err) = child.kill().await {
+                warn!(
+                    sandbox_id,
+                    error = %err,
+                    "failed to terminate host supervisor; relying on kill-on-drop"
+                );
+            }
+        }
+    }
+
+    async fn spawn_host_supervisor(
+        &self,
+        sandbox: &DriverSandbox,
+        launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
+    ) -> Result<(), Status> {
+        let staging_root = secret_staging_dir(&sandbox.id, Some(&self.config.sandbox_namespace))
+            .map_err(|err| {
+                Status::internal(format!(
+                    "resolve per-sandbox staging dir for {} failed: {err}",
+                    sandbox.id
+                ))
+            })?;
+        let supervisor_state = staging_root.join("supervisor");
+        let auth_bundle_path = supervisor_state.join(AUTH_BUNDLE_FILE);
+        let backend_descriptor_path = supervisor_state.join(BACKEND_DESCRIPTOR_FILE);
+        if !auth_bundle_path.is_file() || !backend_descriptor_path.is_file() {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} supervisor staging incomplete ({} / {})",
+                sandbox.id,
+                auth_bundle_path.display(),
+                backend_descriptor_path.display()
+            )));
+        }
+
+        let supervisor_bin = self.host_supervisor_bin();
+        if !supervisor_bin.is_file() {
+            return Err(Status::failed_precondition(format!(
+                "host supervisor binary missing: {}",
+                supervisor_bin.display()
+            )));
+        }
+
+        let sandbox_workspace = staging_root.join("workspace");
+        let supervisor_log_dir = staging_root.join("logs");
+        let _ = std::fs::create_dir_all(&sandbox_workspace);
+        let _ = std::fs::create_dir_all(&supervisor_log_dir);
+
+        let supervisor_stdout = supervisor_log_dir.join("supervisor.stdout.log");
+        let supervisor_stderr = supervisor_log_dir.join("supervisor.stderr.log");
+        let stdout = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&supervisor_stdout)
+            .map_err(|err| {
+                Status::internal(format!("open supervisor log {}: {err}", supervisor_stdout.display()))
+            })?;
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&supervisor_stderr)
+            .map_err(|err| {
+                Status::internal(format!("open supervisor log {}: {err}", supervisor_stderr.display()))
+            })?;
+
+        let mut command = tokio::process::Command::new(&supervisor_bin);
+        command
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .arg(format!(
+                "--backend-descriptor-file={}",
+                backend_descriptor_path.display()
+            ))
+            .arg(format!(
+                "--auth-bundle-file={}",
+                auth_bundle_path.display()
+            ))
+            .arg("--workdir")
+            .arg(&sandbox_workspace)
+            .env(openshell_core::sandbox_env::SANDBOX_ID, &sandbox.id)
+            .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
+            .env(openshell_core::sandbox_env::ENDPOINT, self.config.effective_grpc_endpoint())
+            .env(
+                openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
+                openshell_sandbox_backend::BACKEND_NAME,
+            )
+            .env(
+                openshell_core::sandbox_env::LOG_LEVEL,
+                openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level),
+            );
+        if let (Some(ca), Some(cert), Some(key)) = (
+            self.config.guest_tls_ca.as_ref(),
+            self.config.guest_tls_cert.as_ref(),
+            self.config.guest_tls_key.as_ref(),
+        ) {
+            command
+                .env(openshell_core::sandbox_env::TLS_CA, ca)
+                .env(openshell_core::sandbox_env::TLS_CERT, cert)
+                .env(openshell_core::sandbox_env::TLS_KEY, key);
+        }
+
+        // Carry no SSH socket plumbing for now (host supervisor dials boundary);
+        // SSH relay follows in the next iteration when exec is wired.
+
+        let child = command.spawn().map_err(|err| {
+            Status::internal(format!(
+                "spawn host supervisor '{}' failed: {err}",
+                supervisor_bin.display()
+            ))
+        })?;
+        let mut guard = self.supervisor_children.lock().await;
+        guard.insert(sandbox.id.clone(), child);
+
+        let _ = launch_authentication;
+        Ok(())
+    }
+
     async fn list_entries(&self) -> Result<Vec<AppleContainerListEntry>, Status> {
         self.cli.list().await.map_err(status_from_cli)
     }
@@ -518,7 +714,10 @@ impl AppleContainerComputeDriver {
                 SUPERVISOR_STATE_DIR_MOUNT_PATH,
             ),
             "--mount".to_string(),
-            crate::cli::readonly_bind_mount(
+            // Channel is read-write: the boundary consumes bootstrap.json once,
+            // then binds its Unix socket in the same directory. virtiofs carries
+            // that path host-side where the supervisor dials it.
+            crate::cli::writable_bind_mount(
                 &staging_dirs.channel_mount_dir,
                 CHANNEL_STATE_DIR_MOUNT_PATH,
             ),
@@ -543,9 +742,13 @@ impl AppleContainerComputeDriver {
         // Capability set matches upstream `launch-capability-free` (podman container.rs:1526): the
         // boundary starts as root with the minimal caps it needs to chown workspace + drop to
         // the workload identity. No broader admin caps (SYS_ADMIN / NET_ADMIN / SYS_PTRACE / SYSLOG
-        // were removed; the workload does not own container networking — supervisor handles egress
-        // over the boundary's UDS channel).
-        for cap in ["CHOWN", "SETGID", "SETUID", "SETPCAP"] {
+        // Caps the entrypoint/PID-1 needs inside the Apple VM:
+        //   - SYS_ADMIN: to re-bind /proc/sys/net writable (Apple lacks --sysctl)
+        //   - CHOWN, SETGID, SETUID, SETPCAP: required by upstream launch-capability-free
+        //     so it can chown the workspace and drop credentials to the workload
+        //     identity. After the boundary runs at uid 1000, no further privileged
+        //     operations take place.
+        for cap in ["SYS_ADMIN", "CHOWN", "SETGID", "SETUID", "SETPCAP"] {
             args.push("--cap-add".to_string());
             args.push(cap.to_string());
         }
@@ -1887,6 +2090,7 @@ mod tests {
             gateway_bind_addresses: Vec::new(),
             supervisor_readiness: Arc::new(NeverReady),
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_children: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let sandbox = DriverSandbox {
             id: "sbx-1".to_string(),
@@ -1924,6 +2128,7 @@ mod tests {
             gateway_bind_addresses: Vec::new(),
             supervisor_readiness: Arc::new(NeverReady),
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_children: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let sandbox = DriverSandbox {
             id: "sbx-1".to_string(),
@@ -1974,6 +2179,7 @@ mod tests {
             gateway_bind_addresses: Vec::new(),
             supervisor_readiness: Arc::new(NeverReady),
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_children: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let sandbox = DriverSandbox {
             id: "sbx-1".to_string(),
@@ -2021,6 +2227,7 @@ mod tests {
             gateway_bind_addresses: Vec::new(),
             supervisor_readiness: Arc::new(NeverReady),
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_children: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let sandbox = DriverSandbox {
             id: "sbx-1".to_string(),
@@ -2056,6 +2263,7 @@ mod tests {
             gateway_bind_addresses: Vec::new(),
             supervisor_readiness: Arc::new(NeverReady),
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_children: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let sandbox = DriverSandbox {
             id: "sbx-1".to_string(),
@@ -2109,6 +2317,7 @@ mod tests {
             gateway_bind_addresses: Vec::new(),
             supervisor_readiness: Arc::new(NeverReady),
             events: broadcast::channel(WATCH_BUFFER).0,
+            supervisor_children: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let sandbox = DriverSandbox {
             id: "sbx-1".to_string(),

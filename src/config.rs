@@ -37,6 +37,11 @@ pub struct AppleContainerComputeConfig {
     pub guest_tls_key: Option<PathBuf>,
     /// Parent directory containing the Linux `openshell-sandbox` binary.
     pub supervisor_bin_dir: PathBuf,
+    /// macOS host-side supervisor binary path. Override with
+    /// `OPENSHELL_APPLE_CONTAINER_HOST_SUPERVISOR_BIN`; defaults to
+    /// `~/.local/share/trybox/host-bin/openshell-supervisor` (aarch64-apple-darwin).
+    #[serde(default)]
+    pub host_supervisor_bin: Option<PathBuf>,
     /// Unix socket path where the supervisor exposes SSH relay traffic.
     pub sandbox_ssh_socket_path: String,
     /// Container stop timeout in seconds.
@@ -80,6 +85,7 @@ impl Default for AppleContainerComputeConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             supervisor_bin_dir: PathBuf::new(),
+            host_supervisor_bin: None,
             sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
             log_level: "warn".to_string(),

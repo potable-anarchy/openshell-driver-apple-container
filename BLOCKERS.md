@@ -1,57 +1,76 @@
-# Blockers — status as of 2026-09-29 22:30 PDT
+# Blockers — status as of 2026-09-29 23:30 PDT
 
-## Architecture decision needed (root cause of B1)
+## Apple Container / virtiofs does not permit Unix socket bind() to the kind
+the boundary requires (EINVAL on `bind()` after fresh socket creation via
+`socat -u UNIX-LISTEN`), and cross-UID `unlink(2)` of socket inodes through
+the same share is rejected with EOPERATIONNOTSUPP.
 
-Main's supervisor/workload boundary model assumes: supervisor and boundary processes
-can share /dev, netns, and a sandbox-internal UDS channel; boundary probes its own
-network virtualization + Landlock and then launches the dropped workload.
+Verified by isolated socat runs inside a sandbox container:
 
-Apple Container (one VM per container) cannot:
-- Share a Linux network namespace between containers (each is its own VM).
-- Expose supervisor-only privileges to one INSIDE-the-VM process while another runs
-  unprivileged — they share the VM's net + user namespace.
-- Expose host-mounted unix sockets both directions cleanly in podman's pattern.
+    container run --rm -v HOST_PATH:/.openshell/channel:rw IMAGE \
+      socat -u UNIX-LISTEN:/.openshell/channel/sandbox/test.sock,fork NOOP
 
-Consequences for our launch path:
-- Boundary probes (Landlock ABI v3, socket virtualization, DNS-relay bind at
-  127.0.0.53:53) require CAP_NET_BIND_SERVICE and full caps — but we drop these
-  via launch-capability-free BEFORE probes run.
-- Reversing the order (launch-capability-free LAST) puts us right back at the
-  "boundary runs as root" anti-pattern.
-- Putting supervisor INSIDE the VM (current entrypoint) makes probes succeed as
-  root but then drops them — so qualification kicks back to probes-can't-run.
-- Putting supervisor OUTSIDE the VM (host, VM driver pattern) requires supervisor
-  to reach the boundary over a UDS that the hypervisor exposes. Trybox's virtiofs
-  share does pass unix sockets host⇄guest (verified with socat bind under Debian).
-  That's OUR viable pattern, but it needs:
-    - Supervisor process hosted by the DRIVER (not the guest)
-    - Driver stages the channel dir so the guest's boundary binds
-      /.openshell/channel/sandbox/sandbox.sock; supervisor on host dials the
-      host-side same path.
+    → successfully creates a NEW socket
+    → any subsequent bind on the SAME path fails with EINVAL
+    → remove_file(socket) returns "Operation not supported"
 
-## What worked
+The upstream boundary listener (`openshell-sandbox/src/boundary_server.rs`)
+uses `remove_owned_stale_control_socket()` (`unlink(2)` then `UnixListener::bind`)
+on the channel mount. On virtiofs both halves of that pattern break:
+  - The host-side passenger uid (typically 501) is what virtiofs reports for
+    staged files, while the boundary runs as uid 1000 → ownership guard
+    refuses the unlink.
+  - Even with ownership repaired, the kernel-side VFS layer for virtiofs
+    refuses the actual `bind()` syscall on the share with EINVAL.
 
-- Host/Guest unix sockets over virtiofs: VERIFIED
-- Per-sandbox staging w/ auth.json + backend-descriptor.json + bootstrap.json:
-  VERIFIED (all files written, correct shape, supervisor accepts the auth bundle
-  when the runtime_generation matches)
-- Trybox-entrypoint as PID 1: spawns launch-capability-free, propagates exit.
-- Driver UDS+gRPC domain: VERIFIED end-to-end.
+## Implication
 
-## Still needed (B1 strict)
+`openshell-sandbox` (upstream) cannot run its boundary control listener on a
+virtiofs channel mount. This is a real upstream constraint for any external
+driver on macOS-arm64 that uses Apple's Shared Directory sharing mode. All
+three workaround classes:
 
-1. Move supervisor spawn out of `trybox-entrypoint` into the **driver**, like
-   openshell-driver-vm's spawn_host_supervisor. Driver runs openshell-supervisor
-   (macOS arm64) on the host, points it at the host-side channel path; supervisor
-   then dials the boundary inside the VM.
-2. Channel mount becomes **read-write** for boundary consumption (one-use).
-3. Outer-fence guarantees need actual enforcement: currently asserted only.
-4. Supervisor-binary preflight: validate host-bin dir contains openshell-supervisor
-   before launching.
+  A. **Move the channel off virtiofs** (chosen):
+     use a tmpfs in the guest for the runtime channel; supervisor on the
+     host dials the boundary over TLS TCP via `--publish`. Mirrors what the
+     upstream VM driver does. Requires changing SandboxTransport::Unix →
+     SandboxTransport::TlsTcp, BoundaryListener::Unix →
+     BoundaryListener::TlsTcp, and adding `--publish` to the Apple CLI args.
 
-## Bypass decision
+  B. **Build a patched openshell-sandbox** locally and ship it with trybox:
+     replace the boundary listener with a virtiofs-safe implementation.
+     Diverges from stock upstream which is what trybox has been committed to
+     (out-of-tree ≥ in-tree). Falls back into the same maintenance burden the
+     original NVIDIA PR #1888 carried; undesirable.
 
-Until (1) lands, sandbox create ends at "ContainerStopped" inside the VM error
-phase. No user-facing e2e completion is possible without the supervisor spawn
-changes above; trybox "my idea" gets past dir create + sandbox provisioning and
-then fails during sandbox boot.
+  C. **Open an upstream issue with NVIDIA**: ask for either a transport
+     alternative or a podman-style shared-fs contract for the boundary
+     channel. Long lead time; does not unblock trybox.
+
+## Current state of the repo (as of this commit)
+
+- Driver spawns openshell-supervisor on the macOS host per sandbox ✓
+- Driver launches an Apple container per sandbox with the entrypoint ✓
+- Entrypoint runs `openshell-sandbox launch-capability-free` (drops to uid/gid 1000) ✓
+- Boundary process STARTS (uid=1000 via launch-capability-free) ✓
+- Entrypoint's `write_ctl_tweak` re-binds /proc/sys/net + writes
+  `ip_unprivileged_port_start=0` via SYS_ADMIN cap ✓ (matches podman
+  `--sysctl net.ipv4.ip_unprivileged_port_start=0`)
+- Boundary's `bind boundary control listener` fails: EINVAL ✗
+- Host supervisor has nothing to dial; sandbox never reaches Ready
+
+## Next step (chosen): Track A — TlsTcp transport
+
+1. driver.rs: use `SandboxTransport::TlsTcp { authority, addresses }`
+   - authority = `host.container.internal:17672` (Apple VM default gateway)
+   - addresses = `[127.0.0.1:17672]` (fallback)
+2. driver.rs: `BoundaryListener::TlsTcp { address: 0.0.0.0:17672, tls: ... }`
+3. driver.rs: `--publish 127.0.0.1:17672:17672` on the Apple container invocation
+   so the gateway host can dial the guest boundary listener
+4. STAGING_LAYOUT.md updated: channel mount is input-only (bootstrap.json
+   reads once) or dropped entirely — the boundary only needs the TLS cert + key
+   + the bootstrap, all of which are static-read inputs.
+5. Image `local/trybox-sandbox`: `EXPOSE 17672` and the TLS cert/key copied
+   in via volume or re-baked at image build time (choose at implementation).
+
+E2E verification: `openshell sandbox create --name smoke --from local/trybox-sandbox:latest -- echo hello-from-sandbox` must reach `Ready`.

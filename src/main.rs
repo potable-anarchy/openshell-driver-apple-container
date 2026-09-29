@@ -107,6 +107,12 @@ struct Args {
     )]
     supervisor_bin_dir: PathBuf,
 
+    /// macOS host-side supervisor binary path. Override with
+    /// `OPENSHELL_APPLE_CONTAINER_HOST_SUPERVISOR_BIN`. When unset, the driver
+    /// falls back to `~/.local/share/trybox/host-bin/openshell-supervisor`.
+    #[arg(long, env = openshell_driver_apple_container::driver::HOST_SUPERVISOR_BIN_ENV)]
+    host_supervisor_bin: Option<PathBuf>,
+
     /// Unix socket path inside the guest where the supervisor exposes SSH-relay traffic.
     #[arg(
         long,
@@ -155,6 +161,7 @@ async fn main() -> Result<()> {
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
         supervisor_bin_dir: args.supervisor_bin_dir.clone(),
+        host_supervisor_bin: args.host_supervisor_bin.clone(),
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path.clone(),
         stop_timeout_secs: args.stop_timeout_secs,
         log_level: args.log_level.clone(),
