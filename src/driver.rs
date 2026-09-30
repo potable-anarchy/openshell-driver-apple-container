@@ -334,24 +334,6 @@ impl AppleContainerComputeDriver {
             .await?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         if apple_container_state_needs_resume(&entry.status.state) {
-            self.cli.start(&entry.id).await.map_err(status_from_cli)?;
-
-            // Wait for the container to reach "running" state before
-            // proceeding.  The gateway polls sandbox snapshots and will
-            // mark the sandbox Error if it sees "stopped" during the
-            // brief window between `container start` returning and the
-            // VM actually resuming.
-            for _ in 0..30 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                if let Ok(refreshed) = self.find_managed_entry(sandbox_id, "").await {
-                    if let Some(e) = refreshed {
-                        if e.status.state == "running" {
-                            break;
-                        }
-                    }
-                }
-            }
-
             // Re-spawn the host supervisor after container restart.
             // stop_sandbox kills the supervisor; start_sandbox must bring it
             // back or the boundary waits forever for a supervisor connection.
@@ -368,12 +350,48 @@ impl AppleContainerComputeDriver {
                     ..Default::default()
                 };
                 let auth = decode_launch_authentication(&sandbox)?;
-                // Clean stale staging materials from the previous generation
-                // before re-staging with the new launch_authentication.
+
+                // 1. Read the original boundary host port from the existing
+                //    backend-descriptor.json BEFORE cleanup.  The container's
+                //    --publish mapping is immutable from creation; the re-staged
+                //    descriptor must advertise the same port or the supervisor
+                //    dials a port where nothing listens.
+                let reuse_port =
+                    secret_staging_dir(&sandbox.id, Some(&self.config.sandbox_namespace))
+                        .ok()
+                        .and_then(|root| {
+                            let path = root.join("supervisor").join(BACKEND_DESCRIPTOR_FILE);
+                            std::fs::read(&path).ok()
+                        })
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<SandboxRuntimeDescriptor>(&bytes)
+                                .map_err(|e| {
+                                    warn!(
+                                        sandbox_id = %sandbox_id,
+                                        error = %e,
+                                        "failed to parse old descriptor for port reuse"
+                                    );
+                                    e
+                                })
+                                .ok()
+                        })
+                        .and_then(|desc| match desc.transport {
+                            SandboxTransport::Tcp { addresses, .. } => addresses.into_iter().next(),
+                            _ => None,
+                        })
+                        .map(|addr| addr.port());
+
+                // 2. Wipe old staging + re-stage with NEW auth + reused port.
+                //    This must happen BEFORE `container start` because the guest
+                //    entrypoint copies bootstrap.json + TLS certs from the
+                //    bind-mounted channel dir at boot — staging after start is
+                //    too late and the guest would use OLD TLS material.
                 cleanup_secret_staging_dir(&sandbox.id, &self.config);
-                // Re-write staging materials with the new generation's auth.
+                let reuse_addr =
+                    reuse_port.map(|port| SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)));
                 if let Err(stage_err) =
-                    write_secret_staging_materials(&sandbox, &self.config, &auth, None).await
+                    write_secret_staging_materials(&sandbox, &self.config, &auth, None, reuse_addr)
+                        .await
                 {
                     warn!(
                         sandbox_id = %sandbox_id,
@@ -382,6 +400,28 @@ impl AppleContainerComputeDriver {
                     );
                     return Err(stage_err);
                 }
+
+                // 3. NOW start the container — the entrypoint copies the NEW
+                //    bootstrap + TLS from the re-staged channel mount.
+                self.cli.start(&entry.id).await.map_err(status_from_cli)?;
+
+                // 4. Wait for the container to reach "running" state.
+                //    The gateway polls sandbox snapshots and will mark the
+                //    sandbox Error if it sees "stopped" during the brief
+                //    window between `container start` returning and the VM
+                //    actually resuming.
+                for _ in 0..30 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    if let Ok(refreshed) = self.find_managed_entry(sandbox_id, "").await {
+                        if let Some(e) = refreshed {
+                            if e.status.state == "running" {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 5. Spawn the host supervisor with the NEW descriptor.
                 if let Err(spawn_err) = self.spawn_host_supervisor(&sandbox, &auth).await {
                     warn!(
                         sandbox_id = %sandbox_id,
@@ -389,6 +429,9 @@ impl AppleContainerComputeDriver {
                         "host supervisor re-spawn failed during sandbox start"
                     );
                 }
+            } else {
+                // No new launch_authentication — just restart the container.
+                self.cli.start(&entry.id).await.map_err(status_from_cli)?;
             }
             return Ok(());
         }
@@ -809,6 +852,7 @@ impl AppleContainerComputeDriver {
             &self.config,
             &launch_authentication,
             secret_staging_base,
+            None,
         )
         .await?;
         let mut args = vec!["--name".to_string(), container_name];
@@ -1295,6 +1339,7 @@ async fn write_secret_staging_materials(
     config: &AppleContainerComputeConfig,
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
     secret_staging_base: Option<&Path>,
+    reuse_boundary_address: Option<std::net::SocketAddr>,
 ) -> Result<AppleSecretStagingDirs, Status> {
     let root = secret_staging_dir_with_base(
         &sandbox.id,
@@ -1306,14 +1351,19 @@ async fn write_secret_staging_materials(
     let channel_sandbox_dir = channel_dir.join(CHANNEL_SANDBOX_SUBDIR);
     openshell_core::paths::create_dir_restricted(&root)
         .map_err(|err| Status::internal(format!("create secret staging dir failed: {err}")))?;
-    // The runtime owns the published listener; reserve a free port while building
-    // its descriptor, then release it before `container run` binds. A concurrent
-    // bind makes container creation fail; pinned TLS prevents impersonation.
-    let reservation = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .map_err(|err| Status::internal(format!("reserve boundary port: {err}")))?;
-    let boundary_address = reservation
-        .local_addr()
-        .map_err(|err| Status::internal(format!("read boundary port: {err}")))?;
+    // On the creation path we reserve a free port via TcpListener::bind(0)
+    // and hold the reservation until staging completes to prevent a
+    // concurrent bind.  On the resume path the container already owns the
+    // published port; we reuse the original address and must NOT bind.
+    let boundary_address = if let Some(addr) = reuse_boundary_address {
+        addr
+    } else {
+        let reservation = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|err| Status::internal(format!("reserve boundary port: {err}")))?;
+        reservation
+            .local_addr()
+            .map_err(|err| Status::internal(format!("read boundary port: {err}")))?
+    };
     let result = async {
         openshell_core::paths::create_dir_restricted(&supervisor_dir).map_err(|err| {
             Status::internal(format!("create supervisor staging dir failed: {err}"))
