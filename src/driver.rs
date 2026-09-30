@@ -303,6 +303,10 @@ impl AppleContainerComputeDriver {
             .find_managed_entry(sandbox_id, sandbox_name)
             .await?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        // Terminate the host supervisor before stopping the container so
+        // the supervisor doesn't race to reconnect to a dead boundary.
+        // start_sandbox will re-spawn it from the still-intact staging dir.
+        self.terminate_host_supervisor(sandbox_id).await;
         self.cli
             .stop(&entry.id, self.config.stop_timeout_secs)
             .await
