@@ -13,9 +13,9 @@ use openshell_core::driver_utils::{
     LABEL_SANDBOX_NAMESPACE,
 };
 use openshell_core::proto::compute::v1::{
-    DriverCondition, DriverSandbox, DriverSandboxStatus, GetCapabilitiesResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesSandboxEvent,
-    watch_sandboxes_event,
+    DriverCondition, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
+    GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_isolation_interface::contract::{
     OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
@@ -37,7 +37,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
-use tracing::warn;
+use tracing::{info, warn};
 
 const CONTAINER_PREFIX: &str = "openshell-sandbox-";
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
@@ -331,6 +331,29 @@ impl AppleContainerComputeDriver {
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         if apple_container_state_needs_resume(&entry.status.state) {
             self.cli.start(&entry.id).await.map_err(status_from_cli)?;
+
+            // Re-spawn the host supervisor after container restart.
+            // stop_sandbox kills the supervisor; start_sandbox must bring it
+            // back or the boundary waits forever for a supervisor connection.
+            if !launch_authentication.is_empty() {
+                let sandbox = DriverSandbox {
+                    id: sandbox_id.to_string(),
+                    name: String::new(),
+                    spec: Some(DriverSandboxSpec {
+                        launch_authentication: launch_authentication.to_vec(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let auth = decode_launch_authentication(&sandbox)?;
+                if let Err(spawn_err) = self.spawn_host_supervisor(&sandbox, &auth).await {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %spawn_err,
+                        "host supervisor re-spawn failed during sandbox start"
+                    );
+                }
+            }
             return Ok(());
         }
         if launch_authentication.is_empty() {
@@ -650,7 +673,15 @@ impl AppleContainerComputeDriver {
             .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
             .env(
                 openshell_core::sandbox_env::ENDPOINT,
-                self.config.effective_grpc_endpoint(),
+                // The host supervisor runs on the macOS host, not in the guest.
+                // `host.container.internal` (the guest→host resolver) does not
+                // resolve from the host itself; use the explicit loopback listen
+                // address the gateway serves on.
+                {
+                    let ep = self.config.effective_host_grpc_endpoint();
+                    info!(endpoint = %ep, "host supervisor OPENSHELL_ENDPOINT");
+                    ep
+                },
             )
             .env(
                 openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
@@ -669,6 +700,23 @@ impl AppleContainerComputeDriver {
                 .env(openshell_core::sandbox_env::TLS_CA, ca)
                 .env(openshell_core::sandbox_env::TLS_CERT, cert)
                 .env(openshell_core::sandbox_env::TLS_KEY, key);
+        }
+        // The HOST supervisor (as distinct from the guest sandbox) also needs the
+        // host-side mTLS material to present to the gateway, or the gateway's
+        // client-CA check rejects the dial with `permission denied`.
+        if let (Some(ca), Some(cert), Some(key)) = (
+            self.config.host_tls_ca.as_ref(),
+            self.config.host_tls_cert.as_ref(),
+            self.config.host_tls_key.as_ref(),
+        ) {
+            command
+                .env(openshell_core::sandbox_env::TLS_CA, ca)
+                .env(openshell_core::sandbox_env::TLS_CERT, cert)
+                .env(openshell_core::sandbox_env::TLS_KEY, key);
+        } else {
+            warn!(
+                "apple-container driver host mTLS not configured; host supervisor cannot present a client cert — gateway TLS will reject"
+            );
         }
 
         let child = command.spawn().map_err(|err| {

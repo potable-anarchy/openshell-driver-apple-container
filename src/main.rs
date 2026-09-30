@@ -113,6 +113,19 @@ struct Args {
     #[arg(long, env = openshell_driver_apple_container::driver::HOST_SUPERVISOR_BIN_ENV)]
     host_supervisor_bin: Option<PathBuf>,
 
+    /// Host-side CA bundle for mTLS when the host supervisor dials the gateway
+    /// from the macOS host (the host cannot use `host.container.internal`).
+    #[arg(long)]
+    host_tls_ca: Option<PathBuf>,
+
+    /// Host-side client certificate for the supervisor's mTLS handshake.
+    #[arg(long)]
+    host_tls_cert: Option<PathBuf>,
+
+    /// Host-side client key for the supervisor's mTLS handshake.
+    #[arg(long)]
+    host_tls_key: Option<PathBuf>,
+
     /// Unix socket path inside the guest where the supervisor exposes SSH-relay traffic.
     #[arg(
         long,
@@ -162,6 +175,9 @@ async fn main() -> Result<()> {
         guest_tls_key: args.guest_tls_key.clone(),
         supervisor_bin_dir: args.supervisor_bin_dir.clone(),
         host_supervisor_bin: args.host_supervisor_bin.clone(),
+        host_tls_ca: args.host_tls_ca.clone(),
+        host_tls_cert: args.host_tls_cert.clone(),
+        host_tls_key: args.host_tls_key.clone(),
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path.clone(),
         stop_timeout_secs: args.stop_timeout_secs,
         log_level: args.log_level.clone(),
