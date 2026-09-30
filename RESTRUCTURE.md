@@ -1,45 +1,23 @@
-# Apple Container driver architecture (current)
+# Apple Container driver architecture
 
-## Actors per sandbox
+Each sandbox has a macOS host supervisor and a Linux boundary inside its own
+Apple Container VM. The driver uses upstream OpenShell's authenticated boundary
+protocol without patching OpenShell.
 
-1. **Host supervisor** — `openshell-supervisor` (Mach-O arm64), spawned by the driver as a
-   host process. Talks to the boundary over the sandbox channel's Unix socket
-   (virtiofs-backed, host-visible path). Has its own mTLS + JWT material to reach the
-   gateway. Owns the egress boundary.
+The host supervisor owns gateway authentication and network policy enforcement.
+Its SSH relay lives in a private temporary directory with a short path to fit
+macOS Unix-socket limits. Its process and directory are owned by the driver.
 
-2. **Guest boundary** — `openshell-sandbox` (Linux aarch64 musl), runs inside Apple
-   Container. Entrypoint is `trybox-entrypoint` (also Linux musl) which:
-     1. chowns `SANDBOX_WORKDIR` to uid 1000 (CAP_CHOWN available pre-drop)
-     2. spawns `openshell-sandbox launch-capability-free 1000 1000 /bootstrap.json` (drops caps + uid)
-     3. boundary re-qualifies (Landlock/socket probes now succeed because NS setup happens pre-drop)
-     4. boundary binds `/.openshell/channel/sandbox/sandbox.sock` and waits for supervisor attach.
+The guest entrypoint installs IPv4/IPv6 default-deny firewall rules, permits
+loopback and replies to incoming control connections, and points DNS at
+127.0.0.53. It then copies the read-only bootstrap/TLS inputs to /run/trybox,
+prepares the public CA directory and workspace, and execs the upstream
+capability-free boundary launcher. No privileged parent remains.
 
-## Driver responsibilities (host-side)
+The boundary listens on port 17672. Apple Container publishes this on a unique
+host port bound to 127.0.0.1. SandboxTransport::Tcp uses pinned per-generation TLS;
+the guest uses BoundaryListener::TlsTcp. Unix sockets are never shared through
+virtiofs. Only Linux binaries and bootstrap inputs are shared read-only; gateway
+credentials remain on the host.
 
-- Stage per-sandbox staging dir under `~/.local/state/openshell/apple-container-secrets/<ns>/<id>/`:
-    - `supervisor/auth.json` (gateway's SupervisorAuthBundle)
-    - `supervisor/backend-descriptor.json` (SandboxRuntimeDescriptor for boundary)
-    - `channel/sandbox/bootstrap.json` (BoundaryConfig, one-use)
-    - `channel/sandbox/server.crt` + `server.key` (TLS material for boundary listener)
-- Spawn supervisor with the VM-driver pattern (kill-on-drop, stdout/err to sandbox logs).
-- Spawn Apple Container with:
-    - entrypoint /opt/openshell/bin/trybox-entrypoint
-    - mounts:
-      - supervisor bin dir (Linux binaries inside VM) readonly at /opt/openshell/bin
-      - channel dir (host→guest virtiofs, READ-WRITE so boundary can consume bootstrap + bind socket) at /.openshell/channel
-      - sandbox workspace volume mounted at SANDBOX_WORKDIR
-- Watch processes; teardown on either exit.
-
-## Transport
-
-- Boundary listens on a Unix socket at `/.openshell/channel/sandbox/sandbox.sock` INSIDE the guest.
-- virtiofs mounts this on the host as
-  `~/.local/state/openshell/apple-container-secrets/<ns>/<id>/channel/sandbox/sandbox.sock`.
-- Supervisor (host) connects to the host-side path.
-
-## Known limits
-
-- One Apple VM per sandbox. Supervisor + boundary cannot share a Linux namespace but they
-  share the UDS channel via virtiofs.
-- Workload egress is only over the boundary's UDS relay; the supervisor enforces policies.
-- trybox-entrypoint owns the guest PID 1 lifecycle.
+See BLOCKERS.md for validation and remaining lifecycle limitations.

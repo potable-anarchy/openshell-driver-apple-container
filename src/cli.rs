@@ -296,10 +296,7 @@ pub fn readonly_bind_mount(source: &Path, target: &str) -> String {
 
 #[must_use]
 pub fn writable_bind_mount(source: &Path, target: &str) -> String {
-    format!(
-        "type=bind,source={},target={target}",
-        source.display()
-    )
+    format!("type=bind,source={},target={target}", source.display())
 }
 
 fn redact_args(args: &[String]) -> String {
