@@ -3,3 +3,5 @@
 *.sock
 *.log
 .DS_Store
+.commit-msg
+.commit-msg
