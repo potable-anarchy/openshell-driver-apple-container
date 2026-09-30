@@ -1,0 +1,23 @@
+fix: re-stage secrets + wait for running state on sandbox resume
+
+start_sandbox now:
+1. Waits for the Apple container to reach "running" state after
+   `container start` returns (polls up to 15s) to prevent the
+   gateway from seeing a stale "stopped" snapshot during the
+   brief window before the VM resumes.
+2. Cleans the stale secret staging directory before re-writing
+   auth materials (write_owner_only_file uses create_new(true)
+   which fails on existing files).
+3. Re-stages auth bundle + backend descriptor + TLS certs with
+   the gateway's fresh launch_authentication (new generation_id,
+   new JWT) before re-spawning the host supervisor.
+
+stop_sandbox now terminates the host supervisor before stopping
+the container, so start_sandbox can cleanly re-spawn it.
+
+E2E verified: create → Ready → exec → stop all pass.
+Resume (start) reaches Starting but does not transition to Ready
+because the boundary inside the VM gets a new random port on
+container restart while the supervisor's backend descriptor still
+points at the old port.  Fixing resume requires a stable boundary
+port across restarts — deferred as a known limitation.

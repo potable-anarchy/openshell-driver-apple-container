@@ -336,9 +336,27 @@ impl AppleContainerComputeDriver {
         if apple_container_state_needs_resume(&entry.status.state) {
             self.cli.start(&entry.id).await.map_err(status_from_cli)?;
 
+            // Wait for the container to reach "running" state before
+            // proceeding.  The gateway polls sandbox snapshots and will
+            // mark the sandbox Error if it sees "stopped" during the
+            // brief window between `container start` returning and the
+            // VM actually resuming.
+            for _ in 0..30 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if let Ok(refreshed) = self.find_managed_entry(sandbox_id, "").await {
+                    if let Some(e) = refreshed {
+                        if e.status.state == "running" {
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Re-spawn the host supervisor after container restart.
             // stop_sandbox kills the supervisor; start_sandbox must bring it
             // back or the boundary waits forever for a supervisor connection.
+            // The gateway issues fresh launch_authentication on StartSandbox
+            // (new generation_id, new JWT) — re-stage it before spawning.
             if !launch_authentication.is_empty() {
                 let sandbox = DriverSandbox {
                     id: sandbox_id.to_string(),
@@ -350,6 +368,20 @@ impl AppleContainerComputeDriver {
                     ..Default::default()
                 };
                 let auth = decode_launch_authentication(&sandbox)?;
+                // Clean stale staging materials from the previous generation
+                // before re-staging with the new launch_authentication.
+                cleanup_secret_staging_dir(&sandbox.id, &self.config);
+                // Re-write staging materials with the new generation's auth.
+                if let Err(stage_err) =
+                    write_secret_staging_materials(&sandbox, &self.config, &auth, None).await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %stage_err,
+                        "re-staging secret materials failed during sandbox start"
+                    );
+                    return Err(stage_err);
+                }
                 if let Err(spawn_err) = self.spawn_host_supervisor(&sandbox, &auth).await {
                     warn!(
                         sandbox_id = %sandbox_id,
