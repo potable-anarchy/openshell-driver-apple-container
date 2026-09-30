@@ -340,9 +340,15 @@ impl AppleContainerComputeDriver {
             // The gateway issues fresh launch_authentication on StartSandbox
             // (new generation_id, new JWT) — re-stage it before spawning.
             if !launch_authentication.is_empty() {
+                let sandbox_name = entry
+                    .configuration
+                    .labels
+                    .get(LABEL_SANDBOX_NAME)
+                    .cloned()
+                    .unwrap_or_default();
                 let sandbox = DriverSandbox {
                     id: sandbox_id.to_string(),
-                    name: String::new(),
+                    name: sandbox_name,
                     spec: Some(DriverSandboxSpec {
                         launch_authentication: launch_authentication.to_vec(),
                         ..Default::default()
@@ -758,7 +764,7 @@ impl AppleContainerComputeDriver {
                 // address the gateway serves on.
                 {
                     let ep = self.config.effective_host_grpc_endpoint();
-                    info!(endpoint = %ep, "host supervisor OPENSHELL_ENDPOINT");
+                    info!(endpoint = %ep, sandbox_id = %sandbox.id, sandbox_name = %sandbox.name, "host supervisor OPENSHELL_ENDPOINT");
                     ep
                 },
             )
